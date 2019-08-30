@@ -1,0 +1,180 @@
+/**
+ * Tencent is pleased to support the open source community by making WePY available.
+ * Copyright (C) 2017 THL A29 Limited, a Tencent company. All rights reserved.
+ *
+ * Licensed under the MIT License (the "License"); you may not use this file except in compliance with the License. You may obtain a copy of the License at
+ * http://opensource.org/licenses/MIT
+ * Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the specific language governing permissions and limitations under the License.
+ */
+const sfcCompiler = require('vue-template-compiler');
+const fs = require('fs');
+const path = require('path');
+
+const wxmlAst = require('../../ast/wxml');
+const CONST = require('../../util/const');
+
+function genSfcBlockOption (file, langMap, type) {
+  let option = Object.keys(langMap)
+    .map(extname => {
+      return {
+        content: readFile(file + extname),
+        type,
+        lang: langMap[extname]
+      }
+    })
+    .find(option => !!option.content)
+
+    option = option || {
+      content: '',
+      type,
+      lang: Object.values(langMap)[0]
+    }
+
+  return option
+}
+
+function analyzeFile (file) {
+  const { styleLang, templateLang, scriptLang } = CONST.LANG_MAP
+
+  return {
+    style: genSfcBlockOption(file, styleLang, 'style'),
+    template: genSfcBlockOption(file, templateLang, 'template'),
+    script: genSfcBlockOption(file, scriptLang, 'script')
+  }
+}
+
+function readFile (file, defaultValue = '') {
+  if (fs.existsSync(file)) {
+    return fs.readFileSync(file, 'utf-8');
+  }
+  return defaultValue;
+}
+
+exports = module.exports = function () {
+  this.register('wepy-parser-component', function (comp) {
+    let parsedPath = path.parse(comp.path);
+    let file = path.join(parsedPath.dir, parsedPath.name);
+    let sfc = {
+      styles: [],
+      script: {},
+      template: {}
+    };
+    let context = {
+      sfc: sfc,
+      file: file,
+      npm: comp.npm,
+      component: comp.component,
+      type: 'weapp', // This is a weapp original component
+    };
+
+    if (!this.compiled[file]) {
+      this.compiled[file] = {};
+    }
+    let wpyTask = [];
+
+    ['.js', '.wxml', 'wxss', '.json'].forEach(v => this.involved[file + v] = 1);
+
+    let styleContent = '';
+    if (fs.existsSync(file + '.wxss')) {  // If there is no wxss, then style is empty
+      styleContent = fs.readFileSync(file + '.wxss', 'utf-8');
+    }
+
+    // sfc.styles[0] = {
+    //   content: readFile(file + '.wxss'),
+    //   type: 'style',
+    //   lang: 'wxss'
+    // };
+
+    // sfc.template = {
+    //   content: readFile(file + '.wxml'),
+    //   type: 'template',
+    //   lang: 'wxml'
+    // };
+
+    // // JS file should be there.
+    // sfc.script = {
+    //   content: readFile(file + '.js'),
+    //   type: 'script',
+    //   lang: 'babel'
+    // };
+
+    sfc.styles[0] = analyzeFile(file).style
+    sfc.template = analyzeFile(file).template
+    sfc.script = analyzeFile(file).script
+
+    sfc.config = {
+      content: readFile(file + '.json', '{}'),
+      type: 'config',
+      lang: 'json'
+    };
+
+    let flow = Promise.resolve(true);
+    let templateContent = sfc.template.content;
+
+    if (templateContent.indexOf('<wxs ') > -1) { // wxs tag inside
+      let templateAst = wxmlAst(sfc.template.content);
+
+      sfc.wxs = [];
+
+      flow = templateAst.then(ast => {
+        let checkSrc = false;
+        let self = this
+        wxmlAst.walk(ast, {
+          name: {
+            wxs (item) {
+              if (item.type === 'tag' && item.name === 'wxs') {
+                if (item.attribs.src) {
+                  checkSrc = true;
+                }
+                sfc.wxs.push({
+                  attrs: item.attribs,
+                  src: checkSrc ? item.attribs.src : '',
+                  lang: 'js',
+                  type: 'wxs',
+                  content: wxmlAst.generate(item.children)
+                });
+                // Remove node;
+                item.data = '';
+                item.children = [];
+                item.type = 'text';
+              }
+            }
+          },
+          attr: {
+            src (item) {
+              self.hookUnique('template-parse-ast-attr-src', {
+                item,
+                name: 'src',
+                expr: item.attribs.src,
+                ctx: context
+              })
+            }
+          }
+        });
+        if (checkSrc) {  // has wxs with src, reset wxml
+          sfc.template.content = wxmlAst.generate(ast);
+        }
+        return checkSrc ? this.hookAsyncSeq('parse-sfc-src', context) : true;
+      });
+    }
+
+
+    return flow.then(() => {
+      if (sfc.wxs) {
+        return Promise.all(sfc.wxs.map(wxs => {
+          return this.applyCompiler(wxs, context);
+        }));
+      }
+    }).then(() => {
+      return this.applyCompiler(sfc.config, context);
+    }).then(() => {
+      return this.applyCompiler(sfc.template, context);
+    }).then(() => {
+      return this.applyCompiler(sfc.script, context);
+    }).then((parsed) => {
+      sfc.script.parsed = parsed;
+      return this.applyCompiler(sfc.styles[0], context);
+    }).then(() => context);
+
+  });
+}

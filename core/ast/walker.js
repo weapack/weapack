@@ -758,7 +758,6 @@ class AstWalker {
       expression.arguments &&
       expression.arguments.length > 0
     ) {
-      debugger
       // (function(...) { }.call/bind(?, ...))
       walkIIFE.call(this, expression.callee.object, expression.arguments.slice(1), expression.arguments[0]);
     } else if(expression.callee.type === "FunctionExpression" && expression.arguments) {
